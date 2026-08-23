@@ -56,6 +56,10 @@ def _wrap_llm(llm):
     return _Wrapped()
 
 
+_MAX_CALLS_PER_TOOL = 3
+_call_counts: dict[str, int] = {}
+
+
 _JSON_TYPE_MAP: dict[str, type] = {
     "string": str,
     "integer": int,
@@ -72,6 +76,11 @@ def _schema_to_pydantic(schema: dict) -> type[BaseModel]:
     required = set(schema.get("required") or [])
     fields: dict[str, Any] = {}
     for name, prop in props.items():
+        # anyOf is generated for union types like `list[str] | None`.
+        # Extract the first non-null branch so we get the real type.
+        if "anyOf" in prop:
+            non_null = [s for s in prop["anyOf"] if s.get("type") != "null"]
+            prop = non_null[0] if non_null else {"type": "string"}
         py_type = _JSON_TYPE_MAP.get(prop.get("type", "string"), str)
         desc = prop.get("description", "")
         if name in required:
@@ -90,7 +99,15 @@ def _make_langchain_tool(session: ClientSession, mcp_tool: Any) -> StructuredToo
     args_schema = _schema_to_pydantic(mcp_tool.input_schema or {})
 
     async def _call(**kwargs: Any) -> str:
-        # Drop the dummy placeholder before forwarding
+        count = _call_counts.get(tool_name, 0)
+        if count >= _MAX_CALLS_PER_TOOL:
+            return (
+                f"Error: '{tool_name}' has already been called {count} time(s) "
+                f"this query (limit: {_MAX_CALLS_PER_TOOL}). "
+                "Use results you already have or try a different approach."
+            )
+        _call_counts[tool_name] = count + 1
+
         kwargs.pop("_placeholder", None)
         result = await session.call_tool(tool_name, arguments=kwargs or None)
         if result.is_error:
@@ -126,7 +143,7 @@ async def main() -> None:
             for t in tools:
                 print(f"  • {t.name}: {t.description}", flush=True)
 
-            llm = _wrap_llm(ChatOllama(model="mistral:7b", temperature=0))
+            llm = _wrap_llm(ChatOllama(model="qwen2.5:7b", temperature=0))
             system_prompt = (
                 "You are a GitHub research assistant with access to live GitHub API tools.\n\n"
                 "STRICT RULES — follow these every single time:\n"
@@ -152,6 +169,7 @@ async def main() -> None:
                 if query.lower() in ("quit", "exit", "q"):
                     break
 
+                _call_counts.clear()
                 # Stream graph steps so tool calls are visible in real time
                 async for chunk in agent.astream(
                     {"messages": [{"role": "user", "content": query}]},

@@ -34,7 +34,7 @@ def list_issues(repo: str, state: str = "open", label: str = "", max_results: in
 
 
 @log_tool_call
-def create_issue(repo: str, title: str, body: str = "", labels: list[str] | None = None) -> dict:
+def create_issue(repo: str, title: str, body: str = "", labels: list = None) -> dict:
     """Open a new issue on a GitHub repository. Only use against personal test repos."""
     if not title or not title.strip():
         return {"error": "title must not be empty"}
