@@ -2,7 +2,7 @@ import sys
 from dotenv import load_dotenv
 from mcp.server import MCPServer
 from tools.search import search_repositories
-from tools.files import get_file_contents
+from tools.files import list_directory, get_file_contents
 from tools.issues import list_issues, create_issue
 from tools.pull_requests import get_pull_requests
 
@@ -11,6 +11,7 @@ load_dotenv()
 mcp = MCPServer("github-mcp")
 
 mcp.tool()(search_repositories)
+mcp.tool()(list_directory)
 mcp.tool()(get_file_contents)
 mcp.tool()(list_issues)
 mcp.tool()(create_issue)
