@@ -4,7 +4,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, create_model
 from langchain_core.tools import StructuredTool
-from langchain_openai import ChatOpenAI
+from langchain_ollama import ChatOllama
 from langgraph.prebuilt import create_react_agent
 from mcp import ClientSession, StdioServerParameters, stdio_client
 
@@ -41,7 +41,7 @@ def _schema_to_pydantic(schema: dict) -> type[BaseModel]:
 def _make_langchain_tool(session: ClientSession, mcp_tool: Any) -> StructuredTool:
     """Wrap a single MCP tool definition as a LangChain StructuredTool."""
     tool_name = mcp_tool.name
-    args_schema = _schema_to_pydantic(mcp_tool.inputSchema or {})
+    args_schema = _schema_to_pydantic(mcp_tool.input_schema or {})
 
     async def _call(**kwargs: Any) -> str:
         # Drop the dummy placeholder before forwarding
@@ -80,8 +80,14 @@ async def main() -> None:
             for t in tools:
                 print(f"  • {t.name}: {t.description}", flush=True)
 
-            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-            agent = create_react_agent(llm, tools)
+            llm = ChatOllama(model="llama3.2:3b", temperature=0)
+            system_prompt = (
+                "You are a GitHub research assistant. "
+                "You help users explore GitHub repositories by searching for projects, "
+                "analyzing their metadata, and answering questions about them. "
+                "Always use the available tools to fetch live data rather than relying on prior knowledge."
+            )
+            agent = create_react_agent(llm, tools, prompt=system_prompt)
 
             print("\n[agent] Ready. Type a query or 'quit' to exit.\n")
             while True:

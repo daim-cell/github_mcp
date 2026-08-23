@@ -1,15 +1,13 @@
 import sys
 from dotenv import load_dotenv
 from mcp.server import MCPServer
+from tools.search import search_repositories
 
 load_dotenv()
 
 mcp = MCPServer("github-mcp")
 
-# ---------------------------------------------------------------------------
-# Tool registrations will be imported here as they are built, e.g.:
-#   from tools.search import search_repositories
-# ---------------------------------------------------------------------------
+mcp.tool()(search_repositories)
 
 
 def _validate_auth() -> None:
