@@ -38,12 +38,17 @@ def create_issue(repo: str, title: str, body: str = "", labels: list[str] | None
     """Open a new issue on a GitHub repository. Only use against personal test repos."""
     if not title or not title.strip():
         return {"error": "title must not be empty"}
+    # Normalise labels: the LLM sometimes sends {} or "" instead of [] or None
+    if not labels or isinstance(labels, dict):
+        labels = []
+    elif isinstance(labels, str):
+        labels = [labels] if labels.strip() else []
     guard_rate_limit()
     try:
         gh = get_github_client()
         repository = gh.get_repo(repo)
         label_objs = []
-        for name in (labels or []):
+        for name in labels:
             try:
                 label_objs.append(repository.get_label(name))
             except Exception:

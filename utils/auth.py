@@ -20,8 +20,11 @@ def get_github_client() -> Github:
 
 
 def guard_rate_limit() -> None:
-    """Block until the GitHub core rate limit has enough remaining calls."""
+    """Raise if the GitHub core rate limit is too low to make a safe API call."""
     core = get_github_client().get_rate_limit().resources.core
     if core.remaining < 10:
-        wait = max(0.0, core.reset.timestamp() - time.time()) + 1
-        time.sleep(wait)
+        reset_in = max(0, int(core.reset.timestamp() - time.time()))
+        raise RuntimeError(
+            f"GitHub rate limit too low ({core.remaining} requests remaining). "
+            f"Limit resets in {reset_in}s. Please wait before retrying."
+        )

@@ -126,7 +126,7 @@ async def main() -> None:
             for t in tools:
                 print(f"  • {t.name}: {t.description}", flush=True)
 
-            llm = _wrap_llm(ChatOllama(model="llama3.2:3b", temperature=0))
+            llm = _wrap_llm(ChatOllama(model="mistral:7b", temperature=0))
             system_prompt = (
                 "You are a GitHub research assistant with access to live GitHub API tools.\n\n"
                 "STRICT RULES — follow these every single time:\n"
