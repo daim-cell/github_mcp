@@ -21,7 +21,7 @@ def get_github_client() -> Github:
 
 def guard_rate_limit() -> None:
     """Block until the GitHub core rate limit has enough remaining calls."""
-    core = get_github_client().get_rate_limit().core
+    core = get_github_client().get_rate_limit().resources.core
     if core.remaining < 10:
         wait = max(0.0, core.reset.timestamp() - time.time()) + 1
         time.sleep(wait)

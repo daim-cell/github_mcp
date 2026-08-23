@@ -2,12 +2,19 @@ import sys
 from dotenv import load_dotenv
 from mcp.server import MCPServer
 from tools.search import search_repositories
+from tools.files import get_file_contents
+from tools.issues import list_issues, create_issue
+from tools.pull_requests import get_pull_requests
 
 load_dotenv()
 
 mcp = MCPServer("github-mcp")
 
 mcp.tool()(search_repositories)
+mcp.tool()(get_file_contents)
+mcp.tool()(list_issues)
+mcp.tool()(create_issue)
+mcp.tool()(get_pull_requests)
 
 
 def _validate_auth() -> None:
