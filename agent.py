@@ -1,14 +1,60 @@
 import asyncio
+import json
 import sys
 from typing import Any, Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, create_model
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import StructuredTool
 from langchain_ollama import ChatOllama
 from langgraph.prebuilt import create_react_agent
 from mcp import ClientSession, StdioServerParameters, stdio_client
 
 load_dotenv()
+
+
+def _patch_tool_calls(msg: AIMessage) -> AIMessage:
+    """Convert text-formatted JSON tool calls to structured tool_calls.
+
+    llama3.2:3b sometimes emits {"name": "...", "parameters": {...}} as plain
+    text instead of using the structured function-calling format. When that
+    happens LangGraph sees no tool_calls and routes to END immediately. This
+    interceptor runs after the LLM and converts the text JSON to a real
+    tool_call so the graph continues normally.
+    """
+    if msg.tool_calls or not isinstance(msg.content, str) or "{" not in msg.content:
+        return msg
+    try:
+        start = msg.content.index("{")
+        obj, _ = json.JSONDecoder().raw_decode(msg.content, start)
+        if not isinstance(obj, dict) or "name" not in obj:
+            return msg
+        params = obj.get("parameters") or obj.get("arguments") or {}
+        if not isinstance(params, dict):
+            return msg
+        return AIMessage(
+            content="",
+            tool_calls=[{
+                "id": f"fallback_{obj['name']}",
+                "name": obj["name"],
+                "args": params,
+                "type": "tool_call",
+            }],
+        )
+    except (ValueError, json.JSONDecodeError, KeyError):
+        return msg
+
+
+def _wrap_llm(llm):
+    """Attach _patch_tool_calls after bind_tools so text JSON becomes real tool calls."""
+    class _Wrapped:
+        def bind_tools(self, tools, **kwargs):
+            return llm.bind_tools(tools, **kwargs) | RunnableLambda(_patch_tool_calls)
+        def __getattr__(self, name):
+            return getattr(llm, name)
+    return _Wrapped()
+
 
 _JSON_TYPE_MAP: dict[str, type] = {
     "string": str,
@@ -80,12 +126,17 @@ async def main() -> None:
             for t in tools:
                 print(f"  • {t.name}: {t.description}", flush=True)
 
-            llm = ChatOllama(model="llama3.2:3b", temperature=0)
+            llm = _wrap_llm(ChatOllama(model="llama3.2:3b", temperature=0))
             system_prompt = (
-                "You are a GitHub research assistant. "
-                "You help users explore GitHub repositories by searching for projects, "
-                "analyzing their metadata, and answering questions about them. "
-                "Always use the available tools to fetch live data rather than relying on prior knowledge."
+                "You are a GitHub research assistant with access to live GitHub API tools.\n\n"
+                "STRICT RULES — follow these every single time:\n"
+                "1. You MUST call a tool before answering ANY question about GitHub repositories, "
+                "issues, files, or pull requests. No exceptions.\n"
+                "2. NEVER answer from your training data — it is outdated and will be wrong.\n"
+                "3. For multi-step questions (e.g. 'find the top repo then list its issues'), "
+                "call tools one at a time, using each result to inform the next call.\n"
+                "4. If a tool returns an error, report it clearly — do not fall back to guessing.\n"
+                "5. Only give a final answer after you have tool results in hand."
             )
             agent = create_react_agent(llm, tools, prompt=system_prompt)
 
@@ -101,10 +152,22 @@ async def main() -> None:
                 if query.lower() in ("quit", "exit", "q"):
                     break
 
-                result = await agent.ainvoke(
-                    {"messages": [{"role": "user", "content": query}]}
-                )
-                print(f"\n{result['messages'][-1].content}\n")
+                # Stream graph steps so tool calls are visible in real time
+                async for chunk in agent.astream(
+                    {"messages": [{"role": "user", "content": query}]},
+                    stream_mode="updates",
+                ):
+                    for node, update in chunk.items():
+                        if node == "tools":
+                            for msg in update.get("messages", []):
+                                print(f"  [tool result: {getattr(msg, 'name', '?')}]", flush=True)
+                        elif node == "agent":
+                            for msg in update.get("messages", []):
+                                tool_calls = getattr(msg, "tool_calls", [])
+                                for tc in tool_calls:
+                                    print(f"  [calling: {tc['name']}({tc['args']})]", flush=True)
+                                if not tool_calls and getattr(msg, "content", ""):
+                                    print(f"\n{msg.content}\n", flush=True)
 
 
 if __name__ == "__main__":
