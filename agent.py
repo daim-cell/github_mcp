@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sys
 import time
 from typing import Any, Optional
@@ -9,7 +10,9 @@ from opentelemetry import trace
 import phoenix as px
 from phoenix.otel import register
 from pydantic import BaseModel, Field, create_model
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage
+from langchain_core.outputs import LLMResult
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import StructuredTool
 from langchain_ollama import ChatOllama
@@ -21,9 +24,52 @@ load_dotenv()
 # cl100k_base is close enough for token estimation across most models
 _tokenizer = tiktoken.get_encoding("cl100k_base")
 
+_COST_PER_1K_INPUT = float(os.getenv("COST_PER_1K_INPUT", "0.0"))
+_COST_PER_1K_OUTPUT = float(os.getenv("COST_PER_1K_OUTPUT", "0.0"))
+
 
 def _count_tokens(text: str) -> int:
     return len(_tokenizer.encode(text))
+
+
+class TokenCostCallbackHandler(BaseCallbackHandler):
+    """Captures real token counts from LLMResult and attaches them to the active OTel span."""
+
+    def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
+        span = trace.get_current_span()
+        if not span.is_recording():
+            return
+
+        prompt_tokens = 0
+        completion_tokens = 0
+
+        # Prefer usage_metadata on the AIMessage (Ollama, OpenAI via langchain-ollama)
+        for gen_row in response.generations:
+            for gen in gen_row:
+                msg = getattr(gen, "message", None)
+                meta = getattr(msg, "usage_metadata", None) or {}
+                if meta:
+                    prompt_tokens += int(meta.get("input_tokens", 0))
+                    completion_tokens += int(meta.get("output_tokens", 0))
+
+        # Fallback: llm_output["token_usage"] for OpenAI-style responses
+        if not prompt_tokens and not completion_tokens:
+            llm_output = response.llm_output or {}
+            usage = llm_output.get("token_usage") or llm_output.get("usage") or llm_output
+            prompt_tokens = int(usage.get("prompt_tokens", usage.get("prompt_eval_count", 0)))
+            completion_tokens = int(usage.get("completion_tokens", usage.get("eval_count", 0)))
+
+        total_tokens = prompt_tokens + completion_tokens
+
+        cost_usd = (
+            prompt_tokens * _COST_PER_1K_INPUT / 1000
+            + completion_tokens * _COST_PER_1K_OUTPUT / 1000
+        )
+
+        span.set_attribute("llm.prompt_tokens", prompt_tokens)
+        span.set_attribute("llm.completion_tokens", completion_tokens)
+        span.set_attribute("llm.total_tokens", total_tokens)
+        span.set_attribute("llm.cost_usd", round(cost_usd, 8))
 
 
 def _setup_tracing() -> trace.Tracer:
@@ -213,6 +259,7 @@ async def main() -> None:
                 "4. If a tool returns an error, report it clearly — do not fall back to guessing.\n"
                 "5. Only give a final answer after you have tool results in hand."
             )
+            token_cb = TokenCostCallbackHandler()
             agent = create_react_agent(llm, tools, prompt=system_prompt)
 
             print("\n[agent] Ready. Type a query or 'quit' to exit.\n")
@@ -228,14 +275,13 @@ async def main() -> None:
                     break
 
                 _call_counts.clear()
-                query_tokens = 0
-                # Stream graph steps so tool calls are visible in real time
                 with tracer.start_as_current_span("agent.query") as query_span:
                     query_span.set_attribute("query.text", query)
                     query_span.set_attribute("query.input_tokens", _count_tokens(query))
                     async for chunk in agent.astream(
                         {"messages": [{"role": "user", "content": query}]},
                         stream_mode="updates",
+                        config={"callbacks": [token_cb]},
                     ):
                         for node, update in chunk.items():
                             if node == "tools":
@@ -243,17 +289,13 @@ async def main() -> None:
                                     print(f"  [tool result: {getattr(msg, 'name', '?')}]", flush=True)
                             elif node == "agent":
                                 for msg in update.get("messages", []):
-                                    content = getattr(msg, "content", "") or ""
-                                    query_tokens += _count_tokens(content if isinstance(content, str) else json.dumps(content))
                                     tool_calls = getattr(msg, "tool_calls", [])
                                     for tc in tool_calls:
-                                        query_tokens += _count_tokens(json.dumps(tc.get("args", {}), default=str))
                                         print(f"  [calling: {tc['name']}({tc['args']})]", flush=True)
+                                    content = getattr(msg, "content", "") or ""
                                     if not tool_calls and content:
                                         print(f"\n{content}\n", flush=True)
-                    query_span.set_attribute("query.llm_tokens", query_tokens)
                     query_span.set_status(trace.StatusCode.OK)
-                print(f"  [tokens used this query: {query_tokens}]", flush=True)
 
 
 if __name__ == "__main__":
