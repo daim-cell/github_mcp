@@ -1,15 +1,16 @@
+from typing import Optional
 from utils.auth import get_github_client, guard_rate_limit
 from utils.logger import log_tool_call
 
 
 @log_tool_call
-def list_issues(repo: str, state: str = "open", label: str = "", max_results: int = 10) -> list[dict]:
+def list_issues(repo: str, state: Optional[str] = None, label: Optional[str] = None, max_results: int = 10) -> list[dict]:
     """List issues for a GitHub repository, optionally filtered by state and label."""
     guard_rate_limit()
     try:
         gh = get_github_client()
         repository = gh.get_repo(repo)
-        kwargs = {"state": state}
+        kwargs = {"state": state or "open"}
         if label:
             kwargs["labels"] = [repository.get_label(label)]
         issues = repository.get_issues(**kwargs)

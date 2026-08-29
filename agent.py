@@ -1,8 +1,13 @@
 import asyncio
 import json
 import sys
+import time
 from typing import Any, Optional
+import tiktoken
 from dotenv import load_dotenv
+from opentelemetry import trace
+import phoenix as px
+from phoenix.otel import register
 from pydantic import BaseModel, Field, create_model
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
@@ -12,6 +17,20 @@ from langgraph.prebuilt import create_react_agent
 from mcp import ClientSession, StdioServerParameters, stdio_client
 
 load_dotenv()
+
+# cl100k_base is close enough for token estimation across most models
+_tokenizer = tiktoken.get_encoding("cl100k_base")
+
+
+def _count_tokens(text: str) -> int:
+    return len(_tokenizer.encode(text))
+
+
+def _setup_tracing() -> trace.Tracer:
+    """Start a local Phoenix session and wire up an OTLP tracer pointing to it."""
+    px.launch_app()
+    register(project_name="github-mcp-agent", batch=False, verbose=False)
+    return trace.get_tracer("github-mcp-agent")
 
 
 def _patch_tool_calls(msg: AIMessage) -> AIMessage:
@@ -93,10 +112,15 @@ def _schema_to_pydantic(schema: dict) -> type[BaseModel]:
     return create_model("ToolArgs", **fields)
 
 
-def _make_langchain_tool(session: ClientSession, mcp_tool: Any) -> StructuredTool:
+_SUMMARY_LIMIT = 500
+
+
+def _make_langchain_tool(
+    session: ClientSession, mcp_tool: Any, tracer: trace.Tracer
+) -> StructuredTool:
     """Wrap a single MCP tool definition as a LangChain StructuredTool."""
     tool_name = mcp_tool.name
-    args_schema = _schema_to_pydantic(mcp_tool.input_schema or {})
+    args_schema = _schema_to_pydantic(mcp_tool.inputSchema or {})
 
     async def _call(**kwargs: Any) -> str:
         count = _call_counts.get(tool_name, 0)
@@ -107,15 +131,47 @@ def _make_langchain_tool(session: ClientSession, mcp_tool: Any) -> StructuredToo
                 "Use results you already have or try a different approach."
             )
         _call_counts[tool_name] = count + 1
-
         kwargs.pop("_placeholder", None)
-        result = await session.call_tool(tool_name, arguments=kwargs or None)
-        if result.is_error:
-            first = result.content[0] if result.content else None
-            return f"Error: {getattr(first, 'text', str(first))}"
-        return "\n".join(
-            getattr(block, "text", str(block)) for block in result.content
-        )
+
+        output = ""
+        error: str | None = None
+        t0 = time.perf_counter()
+        input_text = json.dumps(kwargs, default=str)
+
+        with tracer.start_as_current_span(tool_name) as span:
+            span.set_attribute("tool.name", tool_name)
+            span.set_attribute("tool.inputs", input_text)
+            span.set_attribute("tool.input_tokens", _count_tokens(input_text))
+            try:
+                result = await session.call_tool(tool_name, arguments=kwargs or None)
+                if result.isError:
+                    first = result.content[0] if result.content else None
+                    output = f"Error: {getattr(first, 'text', str(first))}"
+                    error = output
+                else:
+                    output = "\n".join(
+                        getattr(block, "text", str(block)) for block in result.content
+                    )
+            except Exception as exc:
+                output = f"Error: {exc}"
+                error = str(exc)
+                raise
+            finally:
+                latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+                summary = output[:_SUMMARY_LIMIT] + "..." if len(output) > _SUMMARY_LIMIT else output
+                output_tokens = _count_tokens(output)
+                span.set_attribute("tool.output_summary", summary)
+                span.set_attribute("tool.output_tokens", output_tokens)
+                span.set_attribute("tool.total_tokens", _count_tokens(input_text) + output_tokens)
+                span.set_attribute("tool.latency_ms", latency_ms)
+                span.set_attribute("tool.success", error is None)
+                if error:
+                    span.set_attribute("tool.error", error)
+                    span.set_status(trace.StatusCode.ERROR, error)
+                else:
+                    span.set_status(trace.StatusCode.OK)
+
+        return output
 
     return StructuredTool.from_function(
         coroutine=_call,
@@ -126,6 +182,8 @@ def _make_langchain_tool(session: ClientSession, mcp_tool: Any) -> StructuredToo
 
 
 async def main() -> None:
+    tracer = _setup_tracing()
+
     server_params = StdioServerParameters(
         command=sys.executable,
         args=["server.py"],
@@ -137,7 +195,7 @@ async def main() -> None:
             await session.initialize()
 
             tool_list = await session.list_tools()
-            tools = [_make_langchain_tool(session, t) for t in tool_list.tools]
+            tools = [_make_langchain_tool(session, t, tracer) for t in tool_list.tools]
 
             print(f"[agent] Connected. {len(tools)} tool(s) available.", flush=True)
             for t in tools:
@@ -170,22 +228,32 @@ async def main() -> None:
                     break
 
                 _call_counts.clear()
+                query_tokens = 0
                 # Stream graph steps so tool calls are visible in real time
-                async for chunk in agent.astream(
-                    {"messages": [{"role": "user", "content": query}]},
-                    stream_mode="updates",
-                ):
-                    for node, update in chunk.items():
-                        if node == "tools":
-                            for msg in update.get("messages", []):
-                                print(f"  [tool result: {getattr(msg, 'name', '?')}]", flush=True)
-                        elif node == "agent":
-                            for msg in update.get("messages", []):
-                                tool_calls = getattr(msg, "tool_calls", [])
-                                for tc in tool_calls:
-                                    print(f"  [calling: {tc['name']}({tc['args']})]", flush=True)
-                                if not tool_calls and getattr(msg, "content", ""):
-                                    print(f"\n{msg.content}\n", flush=True)
+                with tracer.start_as_current_span("agent.query") as query_span:
+                    query_span.set_attribute("query.text", query)
+                    query_span.set_attribute("query.input_tokens", _count_tokens(query))
+                    async for chunk in agent.astream(
+                        {"messages": [{"role": "user", "content": query}]},
+                        stream_mode="updates",
+                    ):
+                        for node, update in chunk.items():
+                            if node == "tools":
+                                for msg in update.get("messages", []):
+                                    print(f"  [tool result: {getattr(msg, 'name', '?')}]", flush=True)
+                            elif node == "agent":
+                                for msg in update.get("messages", []):
+                                    content = getattr(msg, "content", "") or ""
+                                    query_tokens += _count_tokens(content if isinstance(content, str) else json.dumps(content))
+                                    tool_calls = getattr(msg, "tool_calls", [])
+                                    for tc in tool_calls:
+                                        query_tokens += _count_tokens(json.dumps(tc.get("args", {}), default=str))
+                                        print(f"  [calling: {tc['name']}({tc['args']})]", flush=True)
+                                    if not tool_calls and content:
+                                        print(f"\n{content}\n", flush=True)
+                    query_span.set_attribute("query.llm_tokens", query_tokens)
+                    query_span.set_status(trace.StatusCode.OK)
+                print(f"  [tokens used this query: {query_tokens}]", flush=True)
 
 
 if __name__ == "__main__":
