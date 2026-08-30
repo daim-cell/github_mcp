@@ -11,14 +11,14 @@ import phoenix as px
 from phoenix.otel import register
 from pydantic import BaseModel, Field, create_model
 from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.outputs import LLMResult
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import StructuredTool
 from langchain_ollama import ChatOllama
 from langgraph.prebuilt import create_react_agent
 from mcp import ClientSession, StdioServerParameters, stdio_client
-
+from constants import SUMMARY_LIMIT, INJECTION_PATTERNS, MAX_QUERY_LENGTH, ISSUE_QUERY_PATTERNS, ISSUE_RESPONSE_PATTERN, OUTPUT_FALLBACK, CLASSIFIER_SYSTEM_PROMPT, SAFETY_SYSTEM_PROMPT, AGENT_SYSTEM_PROMPT
 load_dotenv()
 
 # cl100k_base is close enough for token estimation across most models
@@ -26,6 +26,8 @@ _tokenizer = tiktoken.get_encoding("cl100k_base")
 
 _COST_PER_1K_INPUT = float(os.getenv("COST_PER_1K_INPUT", "0.0"))
 _COST_PER_1K_OUTPUT = float(os.getenv("COST_PER_1K_OUTPUT", "0.0"))
+CLASSIFIER_MODEL = os.getenv("CLASSIFIER_MODEL", "llama3.2:3b")
+BASE_MODEL = os.getenv("BASE_MODEL", "qwen2.5:7b")
 
 
 def _count_tokens(text: str) -> int:
@@ -158,7 +160,6 @@ def _schema_to_pydantic(schema: dict) -> type[BaseModel]:
     return create_model("ToolArgs", **fields)
 
 
-_SUMMARY_LIMIT = 500
 
 
 def _make_langchain_tool(
@@ -204,7 +205,7 @@ def _make_langchain_tool(
                 raise
             finally:
                 latency_ms = round((time.perf_counter() - t0) * 1000, 2)
-                summary = output[:_SUMMARY_LIMIT] + "..." if len(output) > _SUMMARY_LIMIT else output
+                summary = output[:SUMMARY_LIMIT] + "..." if len(output) > SUMMARY_LIMIT else output
                 output_tokens = _count_tokens(output)
                 span.set_attribute("tool.output_summary", summary)
                 span.set_attribute("tool.output_tokens", output_tokens)
@@ -227,6 +228,193 @@ def _make_langchain_tool(
     )
 
 
+async def _run_agent_and_collect(
+    agent: Any,
+    messages: list,
+    token_cb: TokenCostCallbackHandler,
+) -> str:
+    """Stream the agent and return the final answer string.
+
+    Prints tool-call status lines in real time; buffers and returns the final
+    answer text without printing so the caller can validate it first.
+    """
+    final_answer = ""
+    async for chunk in agent.astream(
+        {"messages": messages},
+        stream_mode="updates",
+        config={"callbacks": [token_cb]},
+    ):
+        for node, update in chunk.items():
+            if node == "tools":
+                for msg in update.get("messages", []):
+                    print(f"  [tool result: {getattr(msg, 'name', '?')}]", flush=True)
+            elif node == "agent":
+                for msg in update.get("messages", []):
+                    tool_calls = getattr(msg, "tool_calls", [])
+                    for tc in tool_calls:
+                        print(f"  [calling: {tc['name']}({tc['args']})]", flush=True)
+                    content = getattr(msg, "content", "") or ""
+                    if not tool_calls and content:
+                        final_answer = content
+    return final_answer
+
+
+async def validate_input(
+    query: str,
+    classifier_llm: ChatOllama,
+    tracer: trace.Tracer,
+) -> tuple[bool, str]:
+    """Gate the query before the agent graph runs.
+
+    Returns (True, "") if the query passes all checks.
+    Returns (False, user-facing error message) on the first failure.
+    """
+    with tracer.start_as_current_span("input.validation") as span:
+        # Check 1 — length (O(1), run first)
+        if len(query) > MAX_QUERY_LENGTH:
+            reason = f"Query exceeds {MAX_QUERY_LENGTH} characters ({len(query)} submitted)"
+            span.set_attribute("validation.check", "length")
+            span.set_attribute("validation.passed", False)
+            span.set_attribute("validation.rejection_reason", reason)
+            span.set_status(trace.StatusCode.ERROR, "length_exceeded")
+            return (False, f"Query too long ({len(query)} chars). Maximum is {MAX_QUERY_LENGTH} characters.")
+
+        # Check 2 — regex injection patterns
+        for pattern in INJECTION_PATTERNS:
+            if pattern.search(query):
+                reason = f"Matched injection pattern: {pattern.pattern}"
+                span.set_attribute("validation.check", "injection_regex")
+                span.set_attribute("validation.passed", False)
+                span.set_attribute("validation.rejection_reason", reason)
+                span.set_status(trace.StatusCode.ERROR, "injection_detected")
+                return (False, "Query rejected: potential prompt injection detected.")
+
+        # Check 3 — single combined LLM classifier (injection + scope)
+        try:
+            result = await classifier_llm.ainvoke([
+                SystemMessage(content=CLASSIFIER_SYSTEM_PROMPT),
+                HumanMessage(content=f"User query: {query}\n\nResponse:"),
+            ])
+            verdict = (result.content or "").strip().lower()
+            if verdict.startswith("injection"):
+                reason = "LLM classifier detected prompt injection"
+                span.set_attribute("validation.check", "injection_llm")
+                span.set_attribute("validation.passed", False)
+                span.set_attribute("validation.rejection_reason", reason)
+                span.set_status(trace.StatusCode.ERROR, "injection_detected")
+                return (False, "Query rejected: potential prompt injection detected.")
+            if not verdict.startswith("allowed"):
+                reason = f"LLM classifier returned '{verdict}' — query is out of scope"
+                span.set_attribute("validation.check", "scope")
+                span.set_attribute("validation.passed", False)
+                span.set_attribute("validation.rejection_reason", reason)
+                span.set_status(trace.StatusCode.ERROR, "out_of_scope")
+                return (False, "Query rejected: this assistant only handles GitHub-related tasks.")
+        except Exception as exc:
+            # Classifier LLM unavailable — fail open so legitimate queries aren't blocked
+            span.add_event("classifier_llm_error", {"error": str(exc)})
+
+        span.set_attribute("validation.check", "all_passed")
+        span.set_attribute("validation.passed", True)
+        span.set_attribute("validation.rejection_reason", "")
+        span.set_status(trace.StatusCode.OK)
+        return (True, "")
+
+
+async def validate_output(
+    response: str,
+    query: str,
+    classifier_llm: ChatOllama,
+    agent: Any,
+    tracer: trace.Tracer,
+    token_cb: TokenCostCallbackHandler,
+) -> tuple[bool, str]:
+    """Validate the agent's final answer before returning it to the user.
+
+    Returns (True, validated_response) on success.
+    Returns (False, fallback_message) if both the original and retry fail.
+    """
+    with tracer.start_as_current_span("output.validation") as span:
+        if not response:
+            span.set_attribute("validation.passed", False)
+            span.set_attribute("validation.retry_fired", False)
+            span.set_attribute("validation.rejection_reason", "Empty response from agent")
+            span.set_status(trace.StatusCode.ERROR, "empty_response")
+            return (False, OUTPUT_FALLBACK)
+
+        rejection_reason = ""
+        specific_issue = "a complete, accurate answer"
+
+        # Check 1 — schema heuristic for issue-list queries
+        needs_structured = any(p.search(query) for p in ISSUE_QUERY_PATTERNS)
+        if needs_structured and not ISSUE_RESPONSE_PATTERN.search(response):
+            rejection_reason = "Issue-list query returned no issue numbers"
+            specific_issue = "a structured list including issue numbers (e.g., #123), titles, and URLs"
+
+        # Check 2 — safety classifier (skip if already flagged by schema check)
+        if not rejection_reason:
+            try:
+                result = await classifier_llm.ainvoke([
+                    SystemMessage(content=SAFETY_SYSTEM_PROMPT),
+                    HumanMessage(content=f"Response to review: {response}\n\nAssessment:"),
+                ])
+                verdict = (result.content or "").strip().lower()
+                if verdict.startswith("unsafe"):
+                    rejection_reason = "Safety classifier flagged the response"
+                    specific_issue = "a safe, factual response that avoids harmful or misleading content"
+            except Exception as exc:
+                # Safety classifier unavailable — fail open
+                span.add_event("classifier_llm_error", {"error": str(exc)})
+
+        # All checks passed — return as-is
+        if not rejection_reason:
+            span.set_attribute("validation.passed", True)
+            span.set_attribute("validation.retry_fired", False)
+            span.set_attribute("validation.rejection_reason", "")
+            span.set_status(trace.StatusCode.OK)
+            return (True, response)
+
+        # Retry once with an explicit correction instruction
+        span.set_attribute("validation.retry_fired", True)
+        print(f"  [output validation failed: {rejection_reason} — retrying]", flush=True)
+
+        _call_counts.clear()
+        retry_query = (
+            f"{query}\n\n"
+            f"[System: Your previous response was rejected. "
+            f"Please provide {specific_issue}. Try again with a complete answer.]"
+        )
+        retry_response = await _run_agent_and_collect(
+            agent, [{"role": "user", "content": retry_query}], token_cb
+        )
+
+        # Re-run schema + safety checks on the retry response
+        retry_ok = True
+        if needs_structured and not ISSUE_RESPONSE_PATTERN.search(retry_response):
+            retry_ok = False
+        if retry_ok and retry_response:
+            try:
+                result = await classifier_llm.ainvoke([
+                    SystemMessage(content=SAFETY_SYSTEM_PROMPT),
+                    HumanMessage(content=f"Response to review: {retry_response}\n\nAssessment:"),
+                ])
+                if (result.content or "").strip().lower().startswith("unsafe"):
+                    retry_ok = False
+            except Exception:
+                pass  # fail open on classifier error
+
+        if retry_ok and retry_response:
+            span.set_attribute("validation.passed", True)
+            span.set_attribute("validation.rejection_reason", rejection_reason)
+            span.set_status(trace.StatusCode.OK)
+            return (True, retry_response)
+
+        span.set_attribute("validation.passed", False)
+        span.set_attribute("validation.rejection_reason", rejection_reason)
+        span.set_status(trace.StatusCode.ERROR, rejection_reason)
+        return (False, OUTPUT_FALLBACK)
+
+
 async def main() -> None:
     tracer = _setup_tracing()
 
@@ -247,20 +435,12 @@ async def main() -> None:
             for t in tools:
                 print(f"  • {t.name}: {t.description}", flush=True)
 
-            llm = _wrap_llm(ChatOllama(model="qwen2.5:7b", temperature=0))
-            system_prompt = (
-                "You are a GitHub research assistant with access to live GitHub API tools.\n\n"
-                "STRICT RULES — follow these every single time:\n"
-                "1. You MUST call a tool before answering ANY question about GitHub repositories, "
-                "issues, files, or pull requests. No exceptions.\n"
-                "2. NEVER answer from your training data — it is outdated and will be wrong.\n"
-                "3. For multi-step questions (e.g. 'find the top repo then list its issues'), "
-                "call tools one at a time, using each result to inform the next call.\n"
-                "4. If a tool returns an error, report it clearly — do not fall back to guessing.\n"
-                "5. Only give a final answer after you have tool results in hand."
-            )
+            _base_llm = ChatOllama(model=BASE_MODEL, temperature=0)
+            llm = _wrap_llm(_base_llm)
+            classifier_llm = ChatOllama(model=CLASSIFIER_MODEL, temperature=0)
+
             token_cb = TokenCostCallbackHandler()
-            agent = create_react_agent(llm, tools, prompt=system_prompt)
+            agent = create_react_agent(llm, tools, prompt=AGENT_SYSTEM_PROMPT)
 
             print("\n[agent] Ready. Type a query or 'quit' to exit.\n")
             while True:
@@ -275,26 +455,25 @@ async def main() -> None:
                     break
 
                 _call_counts.clear()
+
+                ok, err = await validate_input(query, classifier_llm, tracer)
+                if not ok:
+                    print(f"[rejected] {err}", flush=True)
+                    continue
+
                 with tracer.start_as_current_span("agent.query") as query_span:
                     query_span.set_attribute("query.text", query)
                     query_span.set_attribute("query.input_tokens", _count_tokens(query))
-                    async for chunk in agent.astream(
-                        {"messages": [{"role": "user", "content": query}]},
-                        stream_mode="updates",
-                        config={"callbacks": [token_cb]},
-                    ):
-                        for node, update in chunk.items():
-                            if node == "tools":
-                                for msg in update.get("messages", []):
-                                    print(f"  [tool result: {getattr(msg, 'name', '?')}]", flush=True)
-                            elif node == "agent":
-                                for msg in update.get("messages", []):
-                                    tool_calls = getattr(msg, "tool_calls", [])
-                                    for tc in tool_calls:
-                                        print(f"  [calling: {tc['name']}({tc['args']})]", flush=True)
-                                    content = getattr(msg, "content", "") or ""
-                                    if not tool_calls and content:
-                                        print(f"\n{content}\n", flush=True)
+
+                    response = await _run_agent_and_collect(
+                        agent, [{"role": "user", "content": query}], token_cb
+                    )
+
+                    ok, final = await validate_output(
+                        response, query, classifier_llm, agent, tracer, token_cb
+                    )
+                    print(f"\n{final}\n", flush=True)
+
                     query_span.set_status(trace.StatusCode.OK)
 
 
