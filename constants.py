@@ -50,6 +50,20 @@ SAFETY_SYSTEM_PROMPT = (
     "or clear fabrications presented as fact."
 )
 
+PLANNER_SYSTEM_PROMPT = (
+    "You are a planning assistant for a GitHub research agent. "
+    "Given a user query, produce a concise numbered execution plan that the agent will follow. "
+    "Each step must name a specific GitHub action: search repos, get file contents, list issues, "
+    "list pull requests, or list directory. End with a step to summarize and answer.\n\n"
+    "Rules:\n"
+    "- No tool calls — this is planning only.\n"
+    "- Be concrete: name the repo, file path, or search term where known.\n"
+    "- Output only the numbered list. No preamble, no explanation.\n\n"
+    "Example output for 'what are the open issues on torvalds/linux':\n"
+    "Step 1: Call tool list_issues on torvalds/linux with state=open.\n"
+    "Step 2: Summarize the issues and answer the user."
+)
+
 AGENT_SYSTEM_PROMPT = (
     "You are a GitHub research assistant with access to live GitHub API tools.\n\n"
     "STRICT RULES — follow these every single time:\n"

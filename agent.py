@@ -18,7 +18,7 @@ from langchain_core.tools import StructuredTool
 from langchain_ollama import ChatOllama
 from langgraph.prebuilt import create_react_agent
 from mcp import ClientSession, StdioServerParameters, stdio_client
-from constants import SUMMARY_LIMIT, INJECTION_PATTERNS, MAX_QUERY_LENGTH, ISSUE_QUERY_PATTERNS, ISSUE_RESPONSE_PATTERN, OUTPUT_FALLBACK, CLASSIFIER_SYSTEM_PROMPT, SAFETY_SYSTEM_PROMPT, AGENT_SYSTEM_PROMPT
+from constants import SUMMARY_LIMIT, INJECTION_PATTERNS, MAX_QUERY_LENGTH, ISSUE_QUERY_PATTERNS, ISSUE_RESPONSE_PATTERN, OUTPUT_FALLBACK, CLASSIFIER_SYSTEM_PROMPT, SAFETY_SYSTEM_PROMPT, AGENT_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT
 load_dotenv()
 
 # cl100k_base is close enough for token estimation across most models
@@ -259,6 +259,40 @@ async def _run_agent_and_collect(
     return final_answer
 
 
+async def plan_query(
+    query: str,
+    base_llm: ChatOllama,
+    tracer: trace.Tracer,
+) -> SystemMessage:
+    """Produce an explicit numbered execution plan for the query.
+
+    Opens a 'plan' child span within the active agent.query span.
+    The LLM has no tool access here — pure reasoning only.
+    Returns a SystemMessage that is prepended to the react agent's message list.
+    """
+    with tracer.start_as_current_span("plan") as span:
+        span.set_attribute("plan.query", query)
+        t0 = time.perf_counter()
+        try:
+            result = await base_llm.ainvoke([
+                SystemMessage(content=PLANNER_SYSTEM_PROMPT),
+                HumanMessage(content=query),
+            ])
+            plan_text = (result.content or "").strip()
+        except Exception as exc:
+            plan_text = "Step 1: Answer the user's GitHub question using available tools."
+            span.add_event("plan_llm_error", {"error": str(exc)})
+
+        latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+        span.set_attribute("plan.text", plan_text)
+        span.set_attribute("plan.tokens", _count_tokens(plan_text))
+        span.set_attribute("plan.latency_ms", latency_ms)
+        span.set_status(trace.StatusCode.OK)
+
+    print(f"  [plan]\n{plan_text}\n", flush=True)
+    return SystemMessage(content=f"Execution plan:\n{plan_text}")
+
+
 async def validate_input(
     query: str,
     classifier_llm: ChatOllama,
@@ -465,8 +499,9 @@ async def main() -> None:
                     query_span.set_attribute("query.text", query)
                     query_span.set_attribute("query.input_tokens", _count_tokens(query))
 
+                    plan_msg = await plan_query(query, _base_llm, tracer)
                     response = await _run_agent_and_collect(
-                        agent, [{"role": "user", "content": query}], token_cb
+                        agent, [plan_msg, {"role": "user", "content": query}], token_cb
                     )
 
                     ok, final = await validate_output(
