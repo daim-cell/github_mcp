@@ -64,6 +64,19 @@ PLANNER_SYSTEM_PROMPT = (
     "Step 2: Summarize the issues and answer the user."
 )
 
+BRIEF_SYSTEM_PROMPT = (
+    "You are a research planning assistant. Given a user topic, produce a structured research "
+    "brief as a JSON object with exactly these fields:\n\n"
+    '- "topic" (string): the exact topic as provided\n'
+    '- "key_questions" (list of 3-5 strings): specific, answerable research questions. Each '
+    "question must be answerable via GitHub API (repos, issues, PRs, files) or public web search. "
+    "Be concrete — name repos, technologies, or concepts where possible.\n"
+    '- "required_sources" (list): must be exactly one of ["github"], ["web"], or ["github", "web"]\n'
+    '- "output_format" (string): one sentence describing what the final document should look like\n'
+    '- "approved" (boolean): always false — set by the human approval step\n\n'
+    "Respond with ONLY a valid JSON object. No markdown, no explanation, no code fences."
+)
+
 AGENT_SYSTEM_PROMPT = (
     "You are a GitHub research assistant with access to live GitHub API tools.\n\n"
     "STRICT RULES — follow these every single time:\n"
