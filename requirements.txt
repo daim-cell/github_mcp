@@ -168,3 +168,5 @@ wrapt==2.3.0
 xxhash==4.0.1
 zstandard==0.25.0
 acp-sdk==1.0.3
+chromadb
+tavily-python
