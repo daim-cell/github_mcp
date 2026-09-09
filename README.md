@@ -334,10 +334,13 @@ If validation fails or an agent returns invalid output, the graph routes to `err
 Run the ACP services in separate terminals:
 
 ```bash
+chroma run --path .chromadb --port 8010
 python -m agents.planner
 python -m agents.researcher
 python -m agents.writer
 ```
+
+The ChromaDB server must stay running while the ACP pipeline is active. The researcher and writer are separate processes, so they share memory through Chroma's HTTP server at `127.0.0.1:8010`.
 
 Then start the supervisor:
 
@@ -361,10 +364,26 @@ logs/pipeline_runs.jsonl
 
 `memory/shared_store.py` provides the researcher and writer with shared persistent memory backed by ChromaDB.
 
+For the ACP pipeline, run ChromaDB as a separate local server before starting the agents:
+
+```bash
+chroma run --path .chromadb --port 8010
+```
+
+The shared store connects to:
+
+```text
+127.0.0.1:8010
+```
+
+This is needed because the ACP planner, researcher, writer, and supervisor run in separate processes. The Chroma HTTP server owns the local index and prevents unsafe concurrent access to `.chromadb`.
+
 Findings are split into overlapping token chunks:
 
 * chunk size: 512 tokens
 * overlap: 50 tokens
+* server host: `127.0.0.1`
+* server port: `8010`
 * storage path: `.chromadb`
 * collection name: `research_findings`
 
@@ -482,5 +501,6 @@ planner
 * File and directory tools default to the `main` branch. Pass `branch` explicitly for repositories that use another default branch.
 * `create_issue` requires a token with write permissions for the target repository.
 * The ACP researcher requires `TAVILY_API_KEY` only when a brief includes `web` in `required_sources`.
-* `.chromadb` is created locally when the ACP researcher stores findings.
+* Start `chroma run --path .chromadb --port 8010` before running the ACP researcher and writer.
+* `.chromadb` is created locally when the ChromaDB server stores findings.
 * Tool outputs are intentionally compact so downstream agents can reason over them without receiving unnecessary GitHub API detail.
