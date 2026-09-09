@@ -115,7 +115,7 @@ async def writer_handler(
             + f"\n\nRetrieved context (truncated):\n{truncated_context[:MAX_CONTEXT_CHARS]}"
         )
 
-    _SYNTHESIS_TIMEOUT = 300  # seconds
+    _SYNTHESIS_TIMEOUT = 600  # seconds
     try:
         response = await asyncio.wait_for(
             _llm.ainvoke([HumanMessage(content=synthesis_prompt)]),

@@ -1,7 +1,10 @@
 """
 LangGraph StateGraph orchestrating the Planner → Researcher → Writer pipeline.
 
-Start each agent service before running this:
+Start the Chroma HTTP server FIRST (shared vector store for all agents):
+    chroma run --path .chromadb --port 8010
+
+Then start each agent service:
     python -m agents.planner       # port 8001
     python -m agents.researcher    # port 8002
     python -m agents.writer        # port 8003

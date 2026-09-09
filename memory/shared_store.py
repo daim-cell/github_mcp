@@ -11,8 +11,30 @@ _OVERLAP_TOKENS = 50
 _LOG_FILE = Path(__file__).parent.parent / "logs" / "pipeline_runs.jsonl"
 _tokenizer = tiktoken.get_encoding("cl100k_base")
 
-_client = chromadb.PersistentClient(path=str(Path(__file__).parent.parent / ".chromadb"))
-_collection = _client.get_or_create_collection("research_findings")
+_DB_PATH = str(Path(__file__).parent.parent / ".chromadb")
+
+# Use the Chroma HTTP server if running (port 8000), otherwise fall back to
+# PersistentClient. The HTTP server is a single process that owns the HNSW
+# index exclusively, so concurrent reads/writes across agent processes are safe.
+# Start it with: chroma run --path .chromadb --port 8010
+_CHROMA_HTTP_HOST = "127.0.0.1"
+_CHROMA_HTTP_PORT = 8010
+
+
+def _get_collection():
+    """
+    Return a Chroma collection handle. Prefers the HTTP server (safe for
+    multi-process use); falls back to PersistentClient when the server is
+    not running.
+    """
+    try:
+        client = chromadb.HttpClient(host=_CHROMA_HTTP_HOST, port=_CHROMA_HTTP_PORT)
+        client.heartbeat()  # raises if server not reachable
+        return client.get_or_create_collection("research_findings")
+    except Exception:
+        # HTTP server not running — use PersistentClient (single-process only)
+        client = chromadb.PersistentClient(path=_DB_PATH)
+        return client.get_or_create_collection("research_findings")
 
 
 def _chunk(text: str) -> list[str]:
@@ -39,11 +61,16 @@ def write_findings(
     chunks = _chunk(content)
     base_meta = {"topic": topic, "question": question, **metadata}
 
-    _collection.add(
-        ids=[str(uuid.uuid4()) for _ in chunks],
-        documents=chunks,
-        metadatas=[base_meta] * len(chunks),
-    )
+    try:
+        col = _get_collection()
+        col.add(
+            ids=[str(uuid.uuid4()) for _ in chunks],
+            documents=chunks,
+            metadatas=[base_meta] * len(chunks),
+        )
+    except Exception as e:
+        print(f"  [shared_store] write failed ({e}), findings not persisted", flush=True)
+        return 0
 
     record = {
         "timestamp": time.time(),
@@ -63,20 +90,17 @@ def retrieve_relevant(
 ) -> list[dict]:
     """Retrieve top_k chunks relevant to query, optionally filtered by topic."""
     where = {"topic": topic} if topic else None
-    # ChromaDB raises when n_results exceeds the number of matching documents.
-    # Count filtered docs first; fall back to 1 as the minimum.
+
     try:
-        filtered_count = len(_collection.get(where=where)["ids"]) if where else _collection.count()
-    except Exception:
-        filtered_count = _collection.count()
-    if filtered_count == 0:
+        col = _get_collection()
+        filtered_count = len(col.get(where=where)["ids"]) if where else col.count()
+        if filtered_count == 0:
+            return []
+        n = min(top_k, filtered_count)
+        results = col.query(query_texts=[query], n_results=n, where=where)
+    except Exception as e:
+        print(f"  [shared_store] query failed ({e}), returning empty results", flush=True)
         return []
-    n = min(top_k, filtered_count)
-    results = _collection.query(
-        query_texts=[query],
-        n_results=n,
-        where=where,
-    )
 
     output = []
     docs = results.get("documents", [[]])[0]
