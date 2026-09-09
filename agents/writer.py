@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import sys
@@ -101,8 +102,32 @@ async def writer_handler(
 
     yield "[synthesizing] generating document from retrieved findings..."
 
-    response = await _llm.ainvoke([HumanMessage(content=synthesis_prompt)])
-    document = (response.content or "").strip()
+    # Truncate context to avoid exceeding the model's context window
+    MAX_CONTEXT_CHARS = 12_000
+    if len(synthesis_prompt) > MAX_CONTEXT_CHARS:
+        truncated_context = context_block[:MAX_CONTEXT_CHARS - len(synthesis_prompt) + len(context_block)]
+        synthesis_prompt = (
+            f"{WRITER_SYSTEM_PROMPT}\n\n"
+            f"Topic: {brief.topic}\n"
+            f"Output format: {brief.output_format}\n\n"
+            f"Key questions to address:\n"
+            + "\n".join(f"- {q}" for q in brief.key_questions)
+            + f"\n\nRetrieved context (truncated):\n{truncated_context[:MAX_CONTEXT_CHARS]}"
+        )
+
+    _SYNTHESIS_TIMEOUT = 300  # seconds
+    try:
+        response = await asyncio.wait_for(
+            _llm.ainvoke([HumanMessage(content=synthesis_prompt)]),
+            timeout=_SYNTHESIS_TIMEOUT,
+        )
+        document = (response.content or "").strip()
+    except asyncio.TimeoutError:
+        document = ""
+        print(f"  [writer] synthesis timed out after {_SYNTHESIS_TIMEOUT}s", flush=True)
+    except Exception as e:
+        document = ""
+        print(f"  [writer] synthesis failed: {type(e).__name__}: {e}", flush=True)
 
     if not document:
         yield WriterOutput(
@@ -115,10 +140,13 @@ async def writer_handler(
     # Safety check
     yield "[validating] running safety check on document..."
     try:
-        verdict_msg = await _classifier_llm.ainvoke([
-            SystemMessage(content=SAFETY_SYSTEM_PROMPT),
-            HumanMessage(content=f"Response to review: {document}\n\nAssessment:"),
-        ])
+        verdict_msg = await asyncio.wait_for(
+            _classifier_llm.ainvoke([
+                SystemMessage(content=SAFETY_SYSTEM_PROMPT),
+                HumanMessage(content=f"Response to review: {document}\n\nAssessment:"),
+            ]),
+            timeout=30,
+        )
         verdict = (verdict_msg.content or "").strip().lower()
         validation_passed = not verdict.startswith("unsafe")
     except Exception:

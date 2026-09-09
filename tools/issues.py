@@ -15,8 +15,8 @@ def list_issues(repo: str, state: Optional[str] = None, label: Optional[str] = N
             kwargs["labels"] = [repository.get_label(label)]
         issues = repository.get_issues(**kwargs)
         result = []
-        for issue in issues[:max_results]:
-            # get_issues returns PRs too unless filtered; skip them
+        # get_issues returns PRs too; scan up to 10x max_results to find enough real issues
+        for issue in issues[:max_results * 10]:
             if issue.pull_request:
                 continue
             result.append({
@@ -29,6 +29,8 @@ def list_issues(repo: str, state: Optional[str] = None, label: Optional[str] = N
                 "url": issue.html_url,
                 "body": (issue.body or "")[:500],
             })
+            if len(result) >= max_results:
+                break
         return result
     except Exception as exc:
         return f"Error listing issues: {exc}"

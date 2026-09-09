@@ -26,7 +26,7 @@ from agent import (
     _call_counts,
 )
 from agents.planner import PlannerOutput
-from constants import AGENT_SYSTEM_PROMPT
+from constants import AGENT_SYSTEM_PROMPT, WEB_RESEARCH_PROMPT
 from memory.shared_store import write_findings
 from utils.mcp_session import mcp_tools
 
@@ -51,8 +51,8 @@ _token_cb = TokenCostCallbackHandler()
 _tracer = trace.get_tracer("researcher")
 
 
-_MAX_TOOL_STEPS = 8      # recursion_limit passed to LangGraph
-_QUESTION_TIMEOUT = 120  # seconds per question before giving up
+_MAX_TOOL_STEPS = 10     # recursion_limit passed to LangGraph
+_QUESTION_TIMEOUT = 240  # seconds per question before giving up
 
 
 async def _collect(agent, question: str) -> str:
@@ -62,6 +62,8 @@ async def _collect(agent, question: str) -> str:
     its step budget or timed out without producing a text answer.
     """
     final_answer = ""
+    last_tool_result = ""
+    seen_calls: set[str] = set()  # dedup key: "tool_name|sorted_args"
     try:
         async with asyncio.timeout(_QUESTION_TIMEOUT):
             async for chunk in agent.astream(
@@ -72,25 +74,34 @@ async def _collect(agent, question: str) -> str:
                 for node, update in chunk.items():
                     if node == "tools":
                         for msg in update.get("messages", []):
+                            tool_content = getattr(msg, "content", "") or ""
+                            if tool_content:
+                                last_tool_result = tool_content
                             print(f"  [tool result: {getattr(msg, 'name', '?')}]", flush=True)
                     elif node == "agent":
                         for msg in update.get("messages", []):
                             tool_calls = getattr(msg, "tool_calls", [])
                             for tc in tool_calls:
-                                print(f"  [calling: {tc['name']}({tc['args']})]", flush=True)
+                                dedup_key = f"{tc['name']}|{sorted(tc['args'].items())}"
+                                if dedup_key in seen_calls:
+                                    print(f"  [skip duplicate] {tc['name']}({tc['args']})", flush=True)
+                                else:
+                                    seen_calls.add(dedup_key)
+                                    print(f"  [calling: {tc['name']}({tc['args']})]", flush=True)
                             content = getattr(msg, "content", "") or ""
                             if not tool_calls and content:
                                 final_answer = content
     except TimeoutError:
-        print(f"  [timeout] question exceeded {_QUESTION_TIMEOUT}s — skipping", flush=True)
+        print(f"  [timeout] question exceeded {_QUESTION_TIMEOUT}s — using best available result", flush=True)
     except Exception as e:
-        # GraphRecursionError and other LangGraph errors surface here
         err = str(e)
         if "recursion" in err.lower() or "graph" in err.lower():
             print(f"  [step limit] agent hit {_MAX_TOOL_STEPS} tool steps — stopping", flush=True)
         else:
             print(f"  [error] {err}", flush=True)
-    return final_answer
+    result = final_answer or last_tool_result
+    print(f"  [answer] {result[:200]}{'...' if len(result) > 200 else ''}", flush=True)
+    return result
 
 
 def _make_tavily_tool() -> Tool:
@@ -147,12 +158,13 @@ async def researcher_handler(
             if use_web and tavily_tool:
                 tools.append(tavily_tool)
 
-            agent = create_react_agent(_llm, tools, prompt=AGENT_SYSTEM_PROMPT)
+            print(f"  [tools available: {[t.name for t in tools]}]", flush=True)
+            prompt = WEB_RESEARCH_PROMPT if use_web else AGENT_SYSTEM_PROMPT
+            agent = create_react_agent(_llm, tools, prompt=prompt)
 
             yield f"[researching] {question}"
 
             answer = await _collect(agent, question)
-
             if answer.strip():
                 chunks = write_findings(
                     topic=brief.topic,
