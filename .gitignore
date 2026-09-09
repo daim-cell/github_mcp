@@ -220,3 +220,4 @@ __marimo__/
 CLAUDE.md
 */__init__.py
 /.chromadb
+logs/*

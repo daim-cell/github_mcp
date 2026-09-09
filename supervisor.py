@@ -47,7 +47,7 @@ RESEARCHER_URL = "http://127.0.0.1:8002"
 WRITER_URL = "http://127.0.0.1:8003"
 _HEADERS = {"Content-Type": "application/json"}
 
-_MIN_ANSWERED = 3          # fewer than this → retry researcher
+_MIN_ANSWERED = 1          # fewer than this → retry researcher
 _MAX_RESEARCHER_RETRIES = 1
 
 _classifier_llm = ChatOllama(model=os.getenv("CLASSIFIER_MODEL", "llama3.2:3b"), temperature=0)
