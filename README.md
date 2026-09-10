@@ -389,15 +389,6 @@ Findings are split into overlapping token chunks:
 
 The researcher writes chunks with topic and question metadata. The writer retrieves by broad topic and by each planned question, then deduplicates chunks before synthesis.
 
-## ACP Smoke Test
-
-`test_ping.py` runs a direct end-to-end smoke test against the three ACP services. Start the planner, researcher, and writer services first, then run:
-
-```bash
-python test_ping.py
-```
-
-The test auto-approves the planner brief, sends it to the researcher, and passes the researcher summary to the writer.
 
 ## Agent Validation Flow
 
